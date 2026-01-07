@@ -285,7 +285,6 @@ function formatResult(inn, providerResult, proMode) {
     return ❌ <b>ИНН ${inn}</b>\nНичего не найдено. Проверь цифры и попробуй снова.;
   }
 
-Николай Брюханов, [07.01.2026 22:19]
 if (providerResult?.warning) {
     return ⚠️ <b>ИНН ${inn}</b>\n${escapeHtml(providerResult.warning)}\n\nСейчас могу только принимать ИНН и считать лимиты.\nДальше подключим реальные источники.;
   }
@@ -426,7 +425,6 @@ app.post("/webhook", async (req, res) => {
       const from = cq.from;
       const data = cq.data;
 
-Николай Брюханов, [07.01.2026 22:19]
 if (!chatId || !from) return;
       await upsertUser(from);
 
@@ -580,7 +578,6 @@ if (!chatId || !from) return;
   }
 });
 
-Николай Брюханов, [07.01.2026 22:19]
 /**
  * Auto set webhook on startup (Render)
  */
