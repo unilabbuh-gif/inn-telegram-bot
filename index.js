@@ -192,9 +192,9 @@ async function checkoCompanyByInn(inn) {
   }
 
   // GET: https://api.checko.ru/v2/company?key={API-ключ}&inn={ИНН}
-  const url = https://api.checko.ru/v2/company?key=${encodeURIComponent(
-    CHECKO_API_KEY
-  )}&inn=${encodeURIComponent(inn)};
+  const url = `https://api.checko.ru/v2/company?key=${encodeURIComponent(
+  CHECKO_API_KEY
+)}&inn=${encodeURIComponent(inn)}`;
 
   const r = await fetch(url, { method: "GET" });
   const data = await r.json();
