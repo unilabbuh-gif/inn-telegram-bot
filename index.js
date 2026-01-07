@@ -12,7 +12,9 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const DADATA_TOKEN = process.env.DADATA_TOKEN; // optional (реальные данные)
+const DADATA_TOKEN = process.env.DADATA_TOKEN; // optional
+const CHECKO_API_KEY = process.env.CHECKO_API_KEY; // optional
+
 const ADMIN_IDS = (process.env.ADMIN_IDS || "")
   .split(",")
   .map((s) => s.trim())
@@ -27,33 +29,33 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.warn("⚠️ SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing");
 }
 
-const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
-});
+const sb =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        auth: { persistSession: false },
+      })
+    : null;
 
 const app = express();
 const __dirname = path.resolve();
 
+app.use(express.static(path.join(__dirname, "public")));
 app.use(express.json({ limit: "1mb" }));
 
-// Static webapp
-app.use(express.static(path.join(__dirname, "public")));
 app.get("/app", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
 /**
  * Health checks for Render
- * Render иногда стучится в /health
  */
 app.get("/", (_, res) => res.status(200).send("OK"));
-app.get("/health", (_, res) => res.status(200).json({ ok: true }));
 app.get("/healthz", (_, res) => res.status(200).json({ ok: true }));
 
 /**
  * Telegram API helper
  */
-const tg = (method) => `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
+const tg = (method) => https://api.telegram.org/bot${BOT_TOKEN}/${method};
 
 async function tgCall(method, payload) {
   const r = await fetch(tg(method), {
@@ -62,7 +64,7 @@ async function tgCall(method, payload) {
     body: JSON.stringify(payload),
   });
   const data = await r.json();
-  if (!data.ok) throw new Error(`${method} failed: ${JSON.stringify(data)}`);
+  if (!data.ok) throw new Error(${method} failed: ${JSON.stringify(data)});
   return data.result;
 }
 
@@ -95,10 +97,20 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// минимальный escape для HTML режима Телеграма
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
 /**
- * User management
+ * User management (Supabase)
  */
 async function upsertUser(from) {
+  if (!sb) return { tg_user_id: from.id, plan: "free", pro_until: null, free_checks_left: 1 };
+
   const tg_user_id = from.id;
   const payload = {
     tg_user_id,
@@ -108,7 +120,6 @@ async function upsertUser(from) {
     last_seen_at: nowIso(),
   };
 
-  // upsert by unique tg_user_id
   const { data, error } = await sb
     .from("bot_users")
     .upsert(payload, { onConflict: "tg_user_id" })
@@ -116,6 +127,9 @@ async function upsertUser(from) {
     .single();
 
   if (error) throw error;
+  // если у тебя free_checks_left может быть null при первом апсерте — подстрахуемся:
+  if (data.free_checks_left == null) data.free_checks_left = 1;
+  if (!data.plan) data.plan = "free";
   return data;
 }
 
@@ -126,60 +140,92 @@ function isPro(user) {
 }
 
 async function consumeFreeCheckIfNeeded(user) {
-  if (isPro(user)) return { allowed: true, reason: "pro" };
+  if (isPro(user)) return { allowed: true, reason: "pro", user };
 
-  if (user.free_checks_left > 0) {
+Николай Брюханов, [07.01.2026 22:19]
+const left = Number(user.free_checks_left || 0);
+  if (left > 0) {
+    if (!sb) return { allowed: true, reason: "free_used", user: { ...user, free_checks_left: left - 1 } };
+
     const { data, error } = await sb
       .from("bot_users")
-      .update({ free_checks_left: user.free_checks_left - 1 })
+      .update({ free_checks_left: left - 1 })
       .eq("tg_user_id", user.tg_user_id)
       .select("*")
       .single();
+
     if (error) throw error;
     return { allowed: true, reason: "free_used", user: data };
   }
 
-  return { allowed: false, reason: "limit" };
+  return { allowed: false, reason: "limit", user };
 }
 
 /**
- * INN lookup (cache -> DaData)
+ * Cache
  */
 async function getInnFromCache(inn) {
-  const { data, error } = await sb
-    .from("inn_cache")
-    .select("*")
-    .eq("inn", inn)
-    .single();
-
+  if (!sb) return null;
+  const { data, error } = await sb.from("inn_cache").select("*").eq("inn", inn).single();
   if (error) return null;
   return data?.result || null;
 }
 
 async function saveInnToCache(inn, result) {
+  if (!sb) return;
   await sb.from("inn_cache").upsert(
     { inn, result, updated_at: nowIso() },
     { onConflict: "inn" }
   );
 }
 
-async function dadataFindByInn(inn) {
-  if (!DADATA_TOKEN) {
-    // мягкий режим: без источника, чтобы бот не падал
+/**
+ * Providers
+ */
+
+// Checko provider
+async function checkoCompanyByInn(inn) {
+  if (!CHECKO_API_KEY) {
+    return { warning: "CHECKO_API_KEY не задан. Checko отключён.", inn };
+  }
+
+  // GET: https://api.checko.ru/v2/company?key={API-ключ}&inn={ИНН}
+  const url = https://api.checko.ru/v2/company?key=${encodeURIComponent(
+    CHECKO_API_KEY
+  )}&inn=${encodeURIComponent(inn)};
+
+  const r = await fetch(url, { method: "GET" });
+  const data = await r.json();
+
+  // Checko обычно отдаёт { data: {...} } или { error: {...} }
+  if (!r.ok || data?.error) {
     return {
-      warning: "DADATA_TOKEN не задан. Сейчас демо-режим.",
+      not_found: true,
       inn,
+      source_error: data?.error || data,
     };
   }
 
-  // DaData "findById/party"
+  if (!data?.data) {
+    return { not_found: true, inn };
+  }
+
+  return { provider: "checko", raw: data };
+}
+
+// DaData provider (fallback)
+async function dadataFindByInn(inn) {
+  if (!DADATA_TOKEN) {
+    return { warning: "DADATA_TOKEN не задан. Сейчас демо-режим.", inn };
+  }
+
   const r = await fetch(
     "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party",
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Token ${DADATA_TOKEN}`,
+        Authorization: Token ${DADATA_TOKEN},
       },
       body: JSON.stringify({ query: inn }),
     }
@@ -188,158 +234,120 @@ async function dadataFindByInn(inn) {
   const data = await r.json();
   const first = data?.suggestions?.[0];
   if (!first) return { not_found: true, inn };
-
-  return first; // богатый объект: value, data, etc
-}
-
-// минимальный escape для HTML режима Телеграма
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+  return { provider: "dadata", raw: first };
 }
 
 /**
- * ===== PRO RISK SCORING (0..100) =====
- * 0 = хорошо, 100 = плохо
+ * Risk scoring (PRO)
+ * Мы не “выдумываем” риск-балл из воздуха: показываем флаги, которые реально пришли.
+ * Если Checko отдал список факторов риска — выводим их.
  */
-function monthsBetween(dateIso) {
-  const d = new Date(dateIso);
-  if (Number.isNaN(d.getTime())) return null;
-  const now = new Date();
-  return (now.getFullYear() - d.getFullYear()) * 12 + (now.getMonth() - d.getMonth());
-}
+function extractRiskFlags(providerResult) {
+  // ожидаем checko: { provider:"checko", raw:{data:{...}} }
+  if (providerResult?.provider !== "checko") return [];
 
-function addFlag(flags, points, title, details = "") {
-  flags.push({ points, title, details });
-  return points;
-}
+  const d = providerResult.raw?.data || {};
+  // В API Checko есть "проверка факторов риска" (внутри /company). 3
+  // Конкретные поля могут быть разными, поэтому делаем “поиском” по типовым ключам:
+  const candidates = [];
 
-function scoreRiskFromDaData(result) {
+  // Популярные варианты именования (не гарантируется):
+  // - d.ФакторыРиска (массив/объект)
+  // - d.Риски / d.Risks
+  // - d.Флаги / d.Flags
+  for (const key of ["ФакторыРиска", "Риски", "Флаги", "Risks", "Flags", "risk", "risks"]) {
+    if (d[key]) candidates.push({ key, value: d[key] });
+  }
+
   const flags = [];
-  let score = 0;
-
-  const d = result?.data || {};
-  const status = d.state?.status || ""; // ACTIVE / LIQUIDATING / LIQUIDATED etc
-  const type = d.type || ""; // LEGAL / INDIVIDUAL (обычно)
-  const capital = d.capital?.value ?? null;
-
-  // 1) Статус
-  if (status && status !== "ACTIVE") {
-    score += addFlag(flags, 45, "Статус не ACTIVE", `Текущий статус: ${status}`);
+  for (const c of candidates) {
+    if (Array.isArray(c.value)) {
+      for (const item of c.value) flags.push(String(item));
+    } else if (typeof c.value === "object") {
+      // если объект, попробуем вытянуть “истинные” флаги
+      for (const [k, v] of Object.entries(c.value)) {
+        if (v === true) flags.push(k);
+        if (typeof v === "string" && v.length < 120) flags.push(${k}: ${v});
+      }
+    } else {
+      flags.push(${c.key}: ${String(c.value)});
+    }
   }
 
-  // 2) Возраст (подстрахуемся: дата бывает числом/строкой)
-  let regDateIso = null;
-  const regRaw = d.state?.registration_date || d.state?.reg_date || null;
-  if (regRaw) {
-    regDateIso = typeof regRaw === "number" ? new Date(regRaw).toISOString() : String(regRaw);
-  }
-
-  const ageMonths = regDateIso ? monthsBetween(regDateIso) : null;
-  if (ageMonths !== null) {
-    if (ageMonths < 3) score += addFlag(flags, 20, "Компания младше 3 месяцев", `Возраст: ~${ageMonths} мес.`);
-    else if (ageMonths < 6) score += addFlag(flags, 12, "Компания младше 6 месяцев", `Возраст: ~${ageMonths} мес.`);
-    else if (ageMonths < 12) score += addFlag(flags, 6, "Компания младше 12 месяцев", `Возраст: ~${ageMonths} мес.`);
-  } else {
-    score += addFlag(flags, 5, "Не удалось определить дату регистрации");
-  }
-
-  // 3) Руководитель (для ЮЛ)
-  const mgrName = d.management?.name || "";
-  if (type === "LEGAL" && !mgrName) {
-    score += addFlag(flags, 10, "Нет данных о руководителе");
-  }
-
-  // 4) Адрес
-  const address = d.address?.value || "";
-  if (!address) {
-    score += addFlag(flags, 12, "Нет юридического адреса");
-  }
-
-  // 5) Уставный капитал (мягко)
-  if (capital !== null && typeof capital === "number") {
-    if (capital <= 10000) score += addFlag(flags, 3, "Минимальный уставный капитал", `Капитал: ${capital} ₽`);
-  }
-
-  // 6) ИП/физлицо — инфо, без штрафа
-  if (type === "INDIVIDUAL") {
-    flags.push({
-      points: 0,
-      title: "Это ИП/физлицо",
-      details: "Скоринг рисков для ИП ограничен без доп. источников",
-    });
-  }
-
-  // Clamp
-  score = Math.max(0, Math.min(100, score));
-
-  let level = "низкий";
-  if (score >= 60) level = "высокий";
-  else if (score >= 30) level = "средний";
-
-  return {
-    score,
-    level,
-    flags: flags.sort((a, b) => b.points - a.points),
-  };
+  // Дедуп
+  return [...new Set(flags)].filter(Boolean).slice(0, 12);
 }
 
-function formatRiskBlock(risk) {
-  const header = `📊 <b>Риск-скоринг:</b> <b>${risk.score}/100</b> (${escapeHtml(risk.level)} риск)`;
-  const topFlags = risk.flags
-    .filter((f) => f.points > 0)
-    .slice(0, 6)
-    .map((f) => `• +${f.points} — ${escapeHtml(f.title)}${f.details ? ` <i>(${escapeHtml(f.details)})</i>` : ""}`)
-    .join("\n");
-
-  if (!topFlags) return `${header}\n• Существенных красных флагов по этим данным не найдено.`;
-
-  return `${header}\n${topFlags}`;
-}
-
-/**
- * Result formatting (FREE vs PRO)
- */
-function formatResult(inn, result, showRisk = false) {
-  if (result?.not_found) {
-    return `❌ <b>ИНН ${inn}</b>\nНичего не найдено. Проверь цифры и попробуй снова.`;
+function formatResult(inn, providerResult, proMode) {
+  if (providerResult?.not_found) {
+    return ❌ <b>ИНН ${inn}</b>\nНичего не найдено. Проверь цифры и попробуй снова.;
   }
 
-  if (result?.warning) {
-    return `⚠️ <b>ИНН ${inn}</b>\n${result.warning}\n\nСейчас могу только принимать ИНН и считать лимиты.\nДальше подключим реальные источники.`;
+Николай Брюханов, [07.01.2026 22:19]
+if (providerResult?.warning) {
+    return ⚠️ <b>ИНН ${inn}</b>\n${escapeHtml(providerResult.warning)}\n\nСейчас могу только принимать ИНН и считать лимиты.\nДальше подключим реальные источники.;
   }
 
-  const d = result.data || {};
-  const name = d.name?.short_with_opf || d.name?.full_with_opf || result.value || "—";
-  const status = d.state?.status || "—";
-  const okved = d.okved || "—";
-  const address = d.address?.value || "—";
-  const ogrn = d.ogrn || "—";
-  const kpp = d.kpp || "—";
-  const mgr = d.management?.name || "—";
+  // CHECKO
+  if (providerResult?.provider === "checko") {
+    const d = providerResult.raw?.data || {};
+    const name = d["НаимСокр"]  d["НаимПолн"]  "—";
+    const status = d?.["Статус"]?.["Наим"] || "—";
+    const okved = d?.["ОКВЭД"]?.["Код"]
+      ? ${d["ОКВЭД"]["Код"]} — ${d["ОКВЭД"]["Наим"] || ""}.trim()
+      : "—";
+    const address = d?.["ЮрАдрес"]?.["АдресРФ"] || "—";
 
-  let riskText = "";
-  if (showRisk) {
-    const risk = scoreRiskFromDaData(result);
-    riskText = `\n\n${formatRiskBlock(risk)}\n\n💡 <i>Суды/ФССП/банкротства добавим следующим источником.</i>`;
-  } else {
-    riskText = `\n\n💎 <i>В PRO появится риск-скоринг 0–100 и “красные флаги”.</i>`;
+    const lines = [
+      ✅ <b>Проверка по ИНН:</b> <code>${inn}</code>,
+      ``,
+      🏢 <b>Организация:</b> ${escapeHtml(name)},
+      📌 <b>Статус:</b> ${escapeHtml(status)},
+      🧩 <b>ОКВЭД:</b> ${escapeHtml(okved)},
+      📍 <b>Адрес:</b> ${escapeHtml(address)},
+    ];
+
+    if (proMode) {
+      const flags = extractRiskFlags(providerResult);
+      lines.push(``, 💎 <b>PRO: риск-флаги</b>);
+      if (flags.length === 0) {
+        lines.push(— нет явных флагов в ответе источника (или поле не пришло).);
+      } else {
+        for (const f of flags) lines.push(• ${escapeHtml(f)});
+      }
+    } else {
+      lines.push(
+        ``,
+        💡 <i>Хочешь “риск-скоринг” (флаги, реестры, связи)? Это будет в PRO.</i>
+      );
+    }
+
+    return lines.join("\n");
   }
 
-  return [
-    `✅ <b>Проверка по ИНН:</b> <code>${inn}</code>`,
-    ``,
-    `🏢 <b>Организация:</b> ${escapeHtml(name)}`,
-    `📌 <b>Статус:</b> ${escapeHtml(status)}`,
-    `🧾 <b>ОГРН:</b> ${escapeHtml(ogrn)}`,
-    `🏷 <b>КПП:</b> ${escapeHtml(kpp)}`,
-    `👤 <b>Руководитель:</b> ${escapeHtml(mgr)}`,
-    `🧩 <b>ОКВЭД:</b> ${escapeHtml(okved)}`,
-    `📍 <b>Адрес:</b> ${escapeHtml(address)}`,
-    riskText,
-  ].join("\n");
+  // DADATA
+  if (providerResult?.provider === "dadata") {
+    const raw = providerResult.raw || {};
+    const d = raw.data || {};
+    const name = d.name?.short_with_opf  d.name?.full_with_opf  raw.value || "—";
+    const status = d.state?.status || "—";
+    const okved = d.okved || "—";
+    const address = d.address?.value || "—";
+
+    return [
+      ✅ <b>Проверка по ИНН:</b> <code>${inn}</code>,
+      ``,
+      🏢 <b>Организация:</b> ${escapeHtml(name)},
+      📌 <b>Статус:</b> ${escapeHtml(status)},
+      🧩 <b>ОКВЭД:</b> ${escapeHtml(okved)},
+      📍 <b>Адрес:</b> ${escapeHtml(address)},
+      ``,
+      💡 <i>Для риск-флагов лучше подключить Checko API.</i>,
+    ].join("\n");
+  }
+
+  // неизвестно что пришло
+  return ✅ <b>ИНН:</b> <code>${inn}</code>\nПолучены данные, но формат пока не распознан.;
 }
 
 /**
@@ -347,16 +355,16 @@ function formatResult(inn, result, showRisk = false) {
  */
 function paywallText() {
   return [
-    `💎 <b>PRO доступ</b>`,
+    💎 <b>PRO доступ</b>,
     ``,
-    `Ты уже использовал бесплатную проверку.`,
-    `В PRO будет:`,
-    `• безлимит проверок`,
-    `• “красные флаги” по контрагенту`,
-    `• сохранение истории`,
-    `• выгрузка отчёта (PDF)`,
+    Ты уже использовал бесплатную проверку.,
+    В PRO будет:,
+    • безлимит проверок,
+    • “красные флаги” по контрагенту,
+    • сохранение истории,
+    • выгрузка отчёта (PDF),
     ``,
-    `Пока подключение оплаты делаем. Напиши в поддержку — включу PRO вручную после оплаты.`,
+    Пока подключение оплаты делаем. Напиши в поддержку — включу PRO вручную после оплаты.,
   ].join("\n");
 }
 
@@ -365,6 +373,8 @@ function paywallText() {
  * /grant <tg_user_id> <days>
  */
 async function handleAdminCommand(text, chatId) {
+  if (!sb) return false;
+
   const parts = text.trim().split(/\s+/);
   if (parts[0] !== "/grant") return false;
 
@@ -384,11 +394,11 @@ async function handleAdminCommand(text, chatId) {
     .eq("tg_user_id", tgUserId);
 
   if (error) {
-    await sendMessage(chatId, `Ошибка: ${escapeHtml(error.message)}`);
+    await sendMessage(chatId, Ошибка: ${escapeHtml(error.message)});
     return true;
   }
 
-  await sendMessage(chatId, `✅ Выдал PRO пользователю <code>${tgUserId}</code> на ${days} дней.`);
+  await sendMessage(chatId, ✅ Выдал PRO пользователю <code>${tgUserId}</code> на ${days} дней.);
   return true;
 }
 
@@ -414,11 +424,12 @@ app.post("/webhook", async (req, res) => {
       const from = cq.from;
       const data = cq.data;
 
-      if (!chatId || !from) return;
+Николай Брюханов, [07.01.2026 22:19]
+if (!chatId || !from) return;
       await upsertUser(from);
 
       if (data === "CHECK_INN") {
-        await sendMessage(chatId, `Пришли ИНН (10 или 12 цифр).`, {
+        await sendMessage(chatId, Пришли ИНН (10 или 12 цифр)., {
           reply_markup: mainMenu(),
         });
         return;
@@ -433,14 +444,14 @@ app.post("/webhook", async (req, res) => {
         await sendMessage(
           chatId,
           [
-            `🧾 <b>Что я проверяю по ИНН</b>`,
+            🧾 <b>Что я проверяю по ИНН</b>,
             ``,
-            `• название и статус`,
-            `• адрес`,
-            `• ОКВЭД`,
-            `• (дальше) риски и флаги`,
+            • название и статус,
+            • адрес,
+            • ОКВЭД,
+            • (в PRO) риск-флаги/проверки/связи (через источники),
             ``,
-            `Отправь ИНН — покажу.`,
+            Отправь ИНН — покажу.,
           ].join("\n"),
           { reply_markup: mainMenu() }
         );
@@ -450,7 +461,7 @@ app.post("/webhook", async (req, res) => {
       if (data === "SUPPORT") {
         await sendMessage(
           chatId,
-          `🆘 Поддержка: напиши сюда и приложи ИНН/скрин, если что-то не так.\n\n(Позже подключим авто-тикеты)`,
+          🆘 Поддержка: напиши сюда и приложи ИНН/скрин, если что-то не так.,
           { reply_markup: mainMenu() }
         );
         return;
@@ -467,11 +478,11 @@ app.post("/webhook", async (req, res) => {
 
       const user = await upsertUser(from);
 
-      // ЕДИНЫЙ текст: из msg.text или из web_app_data
-      let text = "";
-      if (typeof msg.text === "string") {
-        text = msg.text.trim();
-      } else if (msg.web_app_data?.data) {
+      // вытаскиваем текст/данные
+      let text = (msg.text || "").trim();
+
+      // если прилетело из Telegram WebApp
+      if (!text && msg.web_app_data?.data) {
         try {
           const payload = JSON.parse(msg.web_app_data.data);
           if (payload?.type === "inn_check" && payload?.inn) {
@@ -494,12 +505,12 @@ app.post("/webhook", async (req, res) => {
         await sendMessage(
           chatId,
           [
-            `👋 Привет! Я бот для проверки контрагентов по ИНН.`,
+            👋 Привет! Я бот для проверки контрагентов по ИНН.,
             ``,
-            `✅ 1 проверка бесплатно.`,
-            `💎 В PRO — риск-скоринг и “красные флаги”.`,
+            ✅ 1 проверка бесплатно.,
+            💎 В PRO — риск-флаги и расширенная проверка.,
             ``,
-            `Нажми кнопку или просто пришли ИНН.`,
+            Нажми кнопку или просто пришли ИНН.,
           ].join("\n"),
           { reply_markup: mainMenu() }
         );
@@ -508,7 +519,6 @@ app.post("/webhook", async (req, res) => {
 
       if (!text) return;
 
-      // если человек прислал ИНН
       if (isInn(text)) {
         const gate = await consumeFreeCheckIfNeeded(user);
         if (!gate.allowed) {
@@ -517,49 +527,64 @@ app.post("/webhook", async (req, res) => {
         }
 
         const inn = text;
+        const proMode = isPro(gate.user);
 
-        // cache -> source
-        let result = await getInnFromCache(inn);
+        // cache -> provider
+        let providerResult = await getInnFromCache(inn);
         let source = "cache";
 
-        if (!result) {
-          result = await dadataFindByInn(inn);
-          source = "dadata";
-          if (!result?.warning) await saveInnToCache(inn, result);
+        if (!providerResult) {
+          // 1) Checko если есть ключ
+          if (CHECKO_API_KEY) {
+            providerResult = await checkoCompanyByInn(inn);
+            source = "checko";
+          } else {
+            // 2) DaData fallback
+            providerResult = await dadataFindByInn(inn);
+            source = "dadata";
+          }
+
+          // кэшируем только если это не warning
+          if (!providerResult?.warning) {
+            await saveInnToCache(inn, providerResult);
+          }
         }
 
-        // лог
-        await sb.from("inn_checks").insert({
-          tg_user_id: user.tg_user_id,
-          inn,
-          source,
-          ok: true,
-          result,
-        });
+        // лог запроса
+        if (sb) {
+          await sb.from("inn_checks").insert({
+            tg_user_id: gate.user.tg_user_id,
+            inn,
+            source,
+            ok: true,
+            result: providerResult,
+          });
+        }
 
-        // ВОТ ТУТ: показываем риск-баллы только PRO
-        await sendMessage(chatId, formatResult(inn, result, isPro(user)), {
+        await sendMessage(chatId, formatResult(inn, providerResult, proMode), {
           reply_markup: mainMenu(),
         });
         return;
       }
 
-      // всё остальное
-      await sendMessage(chatId, `Не понял сообщение.\nПришли ИНН (10 или 12 цифр) или нажми кнопку.`, {
-        reply_markup: mainMenu(),
-      });
+      await sendMessage(
+        chatId,
+        Не понял сообщение.\nПришли ИНН (10 или 12 цифр) или нажми кнопку.,
+        { reply_markup: mainMenu() }
+      );
     }
   } catch (e) {
     console.error("Webhook error:", e);
   }
 });
 
+Николай Брюханов, [07.01.2026 22:19]
 /**
- * Auto set webhook on startup (удобно для Render)
+ * Auto set webhook on startup (Render)
  */
 async function ensureWebhook() {
-  if (!APP_URL || !WEBHOOK_SECRET || !BOT_TOKEN) return;
-  const url = `${APP_URL.replace(/\/$/, "")}/webhook`;
+  if (!APP_URL  !WEBHOOK_SECRET  !BOT_TOKEN) return;
+  const url = ${APP_URL.replace(/\/$/, "")}/webhook;
 
   try {
     await tgCall("setWebhook", {
