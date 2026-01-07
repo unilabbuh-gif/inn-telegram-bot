@@ -1,3 +1,4 @@
+import path from "path";
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 
@@ -31,6 +32,13 @@ const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 const app = express();
+const __dirname = path.resolve();
+
+app.use(express.static(path.join(__dirname, "public")));
+
+app.get("/app", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
 app.use(express.json({ limit: "1mb" }));
 
 /**
