@@ -64,7 +64,10 @@ async function tgCall(method, payload) {
     body: JSON.stringify(payload),
   });
   const data = await r.json();
-  if (!data.ok) throw new Error(${method} failed: ${JSON.stringify(data)});
+ if (!data.ok) {
+  throw new Error(`${method} failed: ${JSON.stringify(data)}`);
+}
+
   return data.result;
 }
 
