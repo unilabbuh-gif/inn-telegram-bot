@@ -32,6 +32,8 @@ const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 const app = express();
+
+// В ESM (__dirname нет). path.resolve() = текущая рабочая директория (на Render это ок).
 const __dirname = path.resolve();
 
 app.use(express.static(path.join(__dirname, "public")));
@@ -39,6 +41,7 @@ app.use(express.static(path.join(__dirname, "public")));
 app.get("/app", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
+
 app.use(express.json({ limit: "1mb" }));
 
 /**
@@ -105,7 +108,6 @@ async function upsertUser(from) {
     last_seen_at: nowIso(),
   };
 
-  // upsert by unique tg_user_id
   const { data, error } = await sb
     .from("bot_users")
     .upsert(payload, { onConflict: "tg_user_id" })
@@ -124,6 +126,7 @@ function isPro(user) {
 
 async function consumeFreeCheckIfNeeded(user) {
   if (isPro(user)) return { allowed: true, reason: "pro" };
+
   if (user.free_checks_left > 0) {
     const { data, error } = await sb
       .from("bot_users")
@@ -134,6 +137,7 @@ async function consumeFreeCheckIfNeeded(user) {
     if (error) throw error;
     return { allowed: true, reason: "free_used", user: data };
   }
+
   return { allowed: false, reason: "limit" };
 }
 
@@ -141,7 +145,12 @@ async function consumeFreeCheckIfNeeded(user) {
  * INN lookup (cache -> DaData)
  */
 async function getInnFromCache(inn) {
-  const { data, error } = await sb.from("inn_cache").select("*").eq("inn", inn).single();
+  const { data, error } = await sb
+    .from("inn_cache")
+    .select("*")
+    .eq("inn", inn)
+    .single();
+
   if (error) return null;
   return data?.result || null;
 }
@@ -155,28 +164,29 @@ async function saveInnToCache(inn, result) {
 
 async function dadataFindByInn(inn) {
   if (!DADATA_TOKEN) {
-    // мягкий режим: без источника, чтобы бот не падал
     return {
       warning: "DADATA_TOKEN не задан. Сейчас демо-режим.",
       inn,
     };
   }
 
-  // DaData "findById/party"
-  const r = await fetch("https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Token ${DADATA_TOKEN}`,
-    },
-    body: JSON.stringify({ query: inn }),
-  });
+  const r = await fetch(
+    "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Token ${DADATA_TOKEN}`,
+      },
+      body: JSON.stringify({ query: inn }),
+    }
+  );
 
   const data = await r.json();
   const first = data?.suggestions?.[0];
   if (!first) return { not_found: true, inn };
 
-  return first; // это богатый объект: value, data, etc
+  return first;
 }
 
 function formatResult(inn, result) {
@@ -188,10 +198,13 @@ function formatResult(inn, result) {
     return `⚠️ <b>ИНН ${inn}</b>\n${result.warning}\n\nСейчас могу только принимать ИНН и считать лимиты.\nДальше подключим реальные источники.`;
   }
 
-  // DaData result
-  const v = result.value || inn;
   const d = result.data || {};
-  const name = d.name?.short_with_opf || d.name?.full_with_opf || result.value || "—";
+  const name =
+    d.name?.short_with_opf ||
+    d.name?.full_with_opf ||
+    result.value ||
+    inn ||
+    "—";
   const status = d.state?.status || "—";
   const okved = d.okved || "—";
   const address = d.address?.value || "—";
@@ -208,7 +221,6 @@ function formatResult(inn, result) {
   ].join("\n");
 }
 
-// минимальный escape для HTML режима Телеграма
 function escapeHtml(s) {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -262,7 +274,10 @@ async function handleAdminCommand(text, chatId) {
     return true;
   }
 
-  await sendMessage(chatId, `✅ Выдал PRO пользователю <code>${tgUserId}</code> на ${days} дней.`);
+  await sendMessage(
+    chatId,
+    `✅ Выдал PRO пользователю <code>${tgUserId}</code> на ${days} дней.`
+  );
   return true;
 }
 
@@ -270,13 +285,11 @@ async function handleAdminCommand(text, chatId) {
  * Webhook endpoint
  */
 app.post("/webhook", async (req, res) => {
-  // Telegram secret header check (важно!)
   const secret = req.header("X-Telegram-Bot-Api-Secret-Token");
   if (WEBHOOK_SECRET && secret !== WEBHOOK_SECRET) {
     return res.status(401).json({ ok: false });
   }
 
-  // отвечаем быстро, дальше обрабатываем
   res.status(200).json({ ok: true });
 
   try {
@@ -291,7 +304,7 @@ app.post("/webhook", async (req, res) => {
       const data = cq.data;
 
       if (!chatId || !from) return;
-      const user = await upsertUser(from);
+      await upsertUser(from);
 
       if (data === "CHECK_INN") {
         await sendMessage(chatId, `Пришли ИНН (10 или 12 цифр).`, {
@@ -336,28 +349,30 @@ app.post("/webhook", async (req, res) => {
     // обычные сообщения
     if (update.message) {
       const msg = update.message;
-
-      let text = message?.text || "";
-
-if (!text && message?.web_app_data?.data) {
-  try {
-    const payload = JSON.parse(message.web_app_data.data);
-    if (payload?.type === "inn_check" && payload?.inn) {
-      text = String(payload.inn);
-    } else {
-      text = String(message.web_app_data.data);
-    }
-  } catch {
-    text = String(message.web_app_data.data);
-  }
-}
       const chatId = msg.chat?.id;
       const from = msg.from;
-      const text = (msg.text || "").trim();
 
       if (!chatId || !from) return;
 
       const user = await upsertUser(from);
+
+      // единый текст сообщения (и из текста, и из web_app_data)
+      let text = "";
+
+      if (typeof msg.text === "string") {
+        text = msg.text.trim();
+      } else if (msg.web_app_data?.data) {
+        try {
+          const payload = JSON.parse(msg.web_app_data.data);
+          if (payload?.type === "inn_check" && payload?.inn) {
+            text = String(payload.inn).trim();
+          } else {
+            text = String(msg.web_app_data.data).trim();
+          }
+        } catch {
+          text = String(msg.web_app_data.data).trim();
+        }
+      }
 
       // admin команды
       if (ADMIN_IDS.includes(String(from.id)) && text.startsWith("/grant")) {
@@ -385,7 +400,6 @@ if (!text && message?.web_app_data?.data) {
 
       // если человек прислал ИНН
       if (isInn(text)) {
-        // лимит
         const gate = await consumeFreeCheckIfNeeded(user);
         if (!gate.allowed) {
           await sendMessage(chatId, paywallText(), { reply_markup: mainMenu() });
@@ -394,18 +408,15 @@ if (!text && message?.web_app_data?.data) {
 
         const inn = text;
 
-        // cache -> source
         let result = await getInnFromCache(inn);
         let source = "cache";
 
         if (!result) {
           result = await dadataFindByInn(inn);
           source = "dadata";
-          // кэшируем только если есть что
           if (!result?.warning) await saveInnToCache(inn, result);
         }
 
-        // лог
         await sb.from("inn_checks").insert({
           tg_user_id: user.tg_user_id,
           inn,
@@ -421,9 +432,11 @@ if (!text && message?.web_app_data?.data) {
       }
 
       // всё остальное
-      await sendMessage(chatId, `Не понял сообщение.\nПришли ИНН (10 или 12 цифр) или нажми кнопку.`, {
-        reply_markup: mainMenu(),
-      });
+      await sendMessage(
+        chatId,
+        `Не понял сообщение.\nПришли ИНН (10 или 12 цифр) или нажми кнопку.`,
+        { reply_markup: mainMenu() }
+      );
     }
   } catch (e) {
     console.error("Webhook error:", e);
