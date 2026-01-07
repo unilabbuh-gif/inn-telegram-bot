@@ -336,6 +336,21 @@ app.post("/webhook", async (req, res) => {
     // обычные сообщения
     if (update.message) {
       const msg = update.message;
+
+      let text = message?.text || "";
+
+if (!text && message?.web_app_data?.data) {
+  try {
+    const payload = JSON.parse(message.web_app_data.data);
+    if (payload?.type === "inn_check" && payload?.inn) {
+      text = String(payload.inn);
+    } else {
+      text = String(message.web_app_data.data);
+    }
+  } catch {
+    text = String(message.web_app_data.data);
+  }
+}
       const chatId = msg.chat?.id;
       const from = msg.from;
       const text = (msg.text || "").trim();
