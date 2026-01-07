@@ -145,7 +145,6 @@ function isPro(user) {
 async function consumeFreeCheckIfNeeded(user) {
   if (isPro(user)) return { allowed: true, reason: "pro", user };
 
-Николай Брюханов, [07.01.2026 22:19]
 const left = Number(user.free_checks_left || 0);
   if (left > 0) {
     if (!sb) return { allowed: true, reason: "free_used", user: { ...user, free_checks_left: left - 1 } };
