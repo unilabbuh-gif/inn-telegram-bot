@@ -55,7 +55,7 @@ app.get("/healthz", (_, res) => res.status(200).json({ ok: true }));
 /**
  * Telegram API helper
  */
-const tg = (method) => https://api.telegram.org/bot${BOT_TOKEN}/${method};
+const tg = (method) => `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
 
 async function tgCall(method, payload) {
   const r = await fetch(tg(method), {
