@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>ProverkaBiz — Проверка ИНН</title>
+  <link rel="stylesheet" href="/style.css" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div class="brand">
+        <div class="logo">ИНН</div>
+        <div class="titles">
+          <div class="h1">ProverkaBiz</div>
+          <div class="h2">Проверка ИНН • Физлица и контрагенты</div>
+        </div>
+      </div>
+      <div class="pill" id="envPill">ONLINE</div>
+    </header>
+
+    <main class="card">
+      <div class="cardTitle">Введите ИНН</div>
+      <div class="cardSub">10 или 12 цифр. Отправим в бота и вернём ответ.</div>
+
+      <div class="row">
+        <input id="inn" class="input" inputmode="numeric" placeholder="Например: 7453258064" maxlength="12" />
+        <button id="go" class="btn">Проверить</button>
+      </div>
+
+      <div class="hint">
+        Нажимая «Проверить», вы отправляете ИНН в этот чат.
+      </div>
+
+      <div class="mini">
+        <div class="miniItem">
+          <div class="miniK">Скорость</div>
+          <div class="miniV">≈ 2–5 сек</div>
+        </div>
+        <div class="miniItem">
+          <div class="miniK">Режим</div>
+          <div class="miniV">Официальные источники</div>
+        </div>
+        <div class="miniItem">
+          <div class="miniK">Доступ</div>
+          <div class="miniV">Демо • Premium позже</div>
+        </div>
+      </div>
+    </main>
+
+    <footer class="foot">
+      <div class="footL">© ProverkaBiz</div>
+      <div class="footR">WebApp inside Telegram</div>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
