@@ -1,886 +1,753 @@
-/**
- * ProverkaBizBot — premium Telegram bot (INN checks)
- * Providers: Checko (api.checko.ru)
- * Storage: Supabase (tables + Storage bucket for PDF reports)
- * AI: OpenAI (short interpretation for “legal-style report”)
- *
- * ✅ Features:
- * - Free daily quota (default: 3/day), PRO unlimited (can be tied to subscriptions later)
- * - Cache by INN (inn_cache) with TTL
- * - Save checks log (inn_checks)
- * - Generate “legal style” PDF report, upload to Supabase Storage
- * - Telegram UI: menu buttons, clean output formatting
- *
- * ⚠️ Important:
- * - Put all secrets in Render Environment Variables (not in code)
- * - Use Supabase service role key on server-side only (Render), never in client JS
- */
+/* ================================================
+   ProverkaBizBot — Premium server
+   - Telegram bot (Telegraf)
+   - Webhook (Render)
+   - Checko provider (org data by INN)
+   - Supabase DB + Storage (PDF reports)
+   - OpenAI interpretation (optional)
+   - Quotas + PRO plan skeleton
 
-import express from "express";
-import fetch from "node-fetch";
-import PDFDocument from "pdfkit";
-import { createClient } from "@supabase/supabase-js";
-import OpenAI from "openai";
+   Required env:
+   BOT_TOKEN
+   PUBLIC_BASE_URL
+   SUPABASE_URL
+   SUPABASE_SERVICE_ROLE_KEY
+   SUPABASE_STORAGE_BUCKET
+   CHECKO_API_KEY (or other provider key if you replace)
+   OPENAI_API_KEY (optional)
+   SUPPORT_USERNAME (optional, without @)
+=================================================== */
 
-/* =========================
-   ENV
-========================= */
-const PORT = process.env.PORT || 10000;
+import 'dotenv/config';
+import express from 'express';
+import fetch from 'node-fetch';
+import PDFDocument from 'pdfkit';
+import { createClient } from '@supabase/supabase-js';
+import { Telegraf, Markup } from 'telegraf';
 
-const BOT_TOKEN = process.env.BOT_TOKEN || "";
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ""; // e.g. https://inn-telegram-bot.onrender.com
-const CHECKO_API_KEY = process.env.CHECKO_API_KEY || "";
+/* =======================
+   Env + constants
+======================= */
+const {
+  BOT_TOKEN,
+  PUBLIC_BASE_URL,
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  SUPABASE_STORAGE_BUCKET,
+  CHECKO_API_KEY,
+  OPENAI_API_KEY,
+  SUPPORT_USERNAME,
+  PORT
+} = process.env;
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "ProverkaINN";
+const APP_PORT = Number(PORT || 10000);
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const DAILY_FREE_LIMIT = 3;        // free checks per day
+const PRO_DAYS = 30;               // stub for PRO duration
+const PDF_TTL_DAYS = 30;           // optional: you can delete old PDFs later
 
-/**
- * Limits / cache
- */
-const FREE_DAILY_LIMIT = Number(process.env.FREE_DAILY_LIMIT || 3);
-const CACHE_TTL_HOURS = Number(process.env.CACHE_TTL_HOURS || 24);
-
-/* =========================
-   Basic validation
-========================= */
-function assertEnv() {
-  const missing = [];
-  if (!BOT_TOKEN) missing.push("BOT_TOKEN");
-  if (!SUPABASE_URL) missing.push("SUPABASE_URL");
-  if (!SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
-  if (!PUBLIC_BASE_URL) missing.push("PUBLIC_BASE_URL");
-  // CHECKO_API_KEY optional (bot will still respond, but data will be limited)
-  // OPENAI_API_KEY optional (AI summary disabled without it)
-
-  if (missing.length) {
-    console.error(`[FATAL] Missing env: ${missing.join(", ")}`);
-    process.exit(1);
-  }
+function mustEnv(name, val) {
+  if (!val) throw new Error(`[FATAL] Missing env: ${name}`);
+}
+mustEnv('BOT_TOKEN', BOT_TOKEN);
+mustEnv('SUPABASE_URL', SUPABASE_URL);
+mustEnv('SUPABASE_SERVICE_ROLE_KEY', SUPABASE_SERVICE_ROLE_KEY);
+// PUBLIC_BASE_URL can be temporarily omitted (polling), but for webhook on Render — required
+if (!PUBLIC_BASE_URL) {
+  console.log('[WARN] PUBLIC_BASE_URL missing, webhook setup skipped (bot may still run in polling locally).');
 }
 
-assertEnv();
-
-/* =========================
-   Clients
-========================= */
-const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
+/* =======================
+   Supabase
+======================= */
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false }
 });
 
-const openai = OPENAI_API_KEY
-  ? new OpenAI({ apiKey: OPENAI_API_KEY })
-  : null;
-
-/* =========================
-   Express
-========================= */
-const app = express();
-app.use(express.json({ limit: "2mb" }));
-
-app.get("/", (req, res) => res.status(200).send("OK"));
-app.get("/health", (req, res) => res.status(200).json({ ok: true }));
-
-/* =========================
-   Telegram API helper
-========================= */
-const tg = (method) => `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
-
-async function tgCall(method, payload) {
-  const r = await fetch(tg(method), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data = await r.json();
-  if (!data.ok) {
-    throw new Error(`${method} failed: ${JSON.stringify(data)}`);
-  }
-  return data.result;
-}
-
-async function sendMessage(chatId, text, opts = {}) {
-  return tgCall("sendMessage", {
-    chat_id: chatId,
-    text,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    ...opts,
-  });
-}
-
-async function editMessage(chatId, messageId, text, opts = {}) {
-  return tgCall("editMessageText", {
-    chat_id: chatId,
-    message_id: messageId,
-    text,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    ...opts,
-  });
-}
-
-async function answerCallbackQuery(callbackQueryId, text = "", showAlert = false) {
-  return tgCall("answerCallbackQuery", {
-    callback_query_id: callbackQueryId,
-    text,
-    show_alert: showAlert,
-  });
-}
-
-/* =========================
-   Telegram UI
-========================= */
-function mainMenu() {
-  return {
-    inline_keyboard: [
-      [{ text: "🔎 Проверить ИНН (1 бесплатно)", callback_data: "CHECK_INN" }],
-      [{ text: "💎 Тариф PRO", callback_data: "PRICING" }],
-      [{ text: "❓ Что я проверяю?", callback_data: "ABOUT" }],
-      [{ text: "🆘 Поддержка", callback_data: "SUPPORT" }],
-    ],
-  };
-}
-
-function afterCheckMenu() {
-  return {
-    inline_keyboard: [
-      [{ text: "🔁 Проверить ещё ИНН", callback_data: "CHECK_INN" }],
-      [{ text: "💎 Тариф PRO", callback_data: "PRICING" }],
-      [{ text: "🆘 Поддержка", callback_data: "SUPPORT" }],
-    ],
-  };
-}
-
-function escapeHtml(s = "") {
-  return s
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
-}
-
-function nowIso() {
+/* =======================
+   Helpers
+======================= */
+function nowISO() {
   return new Date().toISOString();
 }
-
-/* =========================
-   Validation
-========================= */
-function isInn(text) {
-  return /^[0-9]{10}$/.test(text) || /^[0-9]{12}$/.test(text);
+function todayKey() {
+  const d = new Date();
+  // YYYY-MM-DD in local server TZ; if you want Moscow/UTC fix — store in UTC and compute there
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-/* =========================
-   DB helpers
-========================= */
+function normalizeInn(text) {
+  const inn = String(text || '').trim();
+  if (!/^\d{10}$/.test(inn) && !/^\d{12}$/.test(inn)) return null;
+  return inn;
+}
 
-/**
- * Tables expected:
- * - bot_users: tg_user_id (bigint), tg_username (text), first_name (text), last_name (text), plan (text), free_checks_left (int), pro_until (timestamptz), created_at, updated_at
- * - inn_cache: inn (text pk), payload (jsonb), fetched_at (timestamptz)
- * - inn_checks: id, tg_user_id, inn, created_at, result_summary (text), risk_level (text), pdf_url (text)
- *
- * NOTE: If your schema differs — fix columns or update code mapping below.
- */
+function moneyFmt(n) {
+  if (n === null || n === undefined) return '—';
+  try {
+    return new Intl.NumberFormat('ru-RU').format(Number(n));
+  } catch {
+    return String(n);
+  }
+}
 
-async function ensureUser(tgUser) {
-  const tg_user_id = BigInt(tgUser.id);
-  const tg_username = tgUser.username || null;
-  const first_name = tgUser.first_name || null;
-  const last_name = tgUser.last_name || null;
+function safeText(s) {
+  if (s === null || s === undefined) return '—';
+  const t = String(s).trim();
+  return t.length ? t : '—';
+}
 
-  // get user
-  const { data: existing, error: e1 } = await sb
-    .from("bot_users")
-    .select("*")
-    .eq("tg_user_id", tg_user_id.toString())
+/* =======================
+   Telegram UI
+======================= */
+const BTN_CHECK = '🔎 Проверить ИНН';
+const BTN_CHECK_AGAIN = '🔁 Проверить ещё ИНН';
+const BTN_PRO = '💎 Тариф PRO';
+const BTN_WHAT = 'ℹ️ Что я проверяю?';
+const BTN_SUPPORT = '🆘 Поддержка';
+
+function mainKeyboard() {
+  return Markup.keyboard([
+    [BTN_CHECK],
+    [BTN_PRO],
+    [BTN_WHAT, BTN_SUPPORT]
+  ]).resize();
+}
+
+/* =======================
+   Database layer
+   Tables expected:
+
+   bot_users:
+     id bigserial PK
+     tg_user_id bigint unique
+     tg_username text
+     first_name text
+     last_name text
+     plan text ('free'|'pro')
+     free_checks_left int
+     pro_until timestamptz null
+     created_at timestamptz default now()
+     updated_at timestamptz default now()
+
+   bot_quota_daily:
+     id bigserial PK
+     tg_user_id bigint
+     day text (YYYY-MM-DD)
+     used int
+     created_at timestamptz default now()
+
+   inn_checks:
+     id bigserial PK
+     tg_user_id bigint
+     inn text
+     kind text (e.g. 'inn')
+     provider text
+     result_summary text
+     risk_level text
+     pdf_url text
+     raw jsonb
+     created_at timestamptz default now()
+     updated_at timestamptz default now()
+
+   subscriptions:
+     id bigserial PK
+     tg_user_id bigint
+     provider text
+     status text
+     started_at timestamptz
+     expires_at timestamptz
+     meta jsonb
+==================================================== */
+
+async function ensureUser(ctx) {
+  const u = ctx.from;
+  const tg_user_id = u.id;
+
+  // try fetch
+  const { data: existing, error: e1 } = await supabase
+    .from('bot_users')
+    .select('*')
+    .eq('tg_user_id', tg_user_id)
     .maybeSingle();
 
-  if (e1) throw e1;
+  if (e1) {
+    console.log('[WARN] ensureUser read failed:', e1?.message || e1);
+  }
 
   if (existing) {
-    // patch username/name if changed
-    const patch = {};
-    if (existing.tg_username !== tg_username) patch.tg_username = tg_username;
-    if (existing.first_name !== first_name) patch.first_name = first_name;
-    if (existing.last_name !== last_name) patch.last_name = last_name;
-    if (Object.keys(patch).length) {
-      patch.updated_at = nowIso();
-      const { error: e2 } = await sb
-        .from("bot_users")
-        .update(patch)
-        .eq("tg_user_id", tg_user_id.toString());
-      if (e2) throw e2;
-    }
+    // update minimal fields
+    const patch = {
+      tg_username: u.username || null,
+      first_name: u.first_name || null,
+      last_name: u.last_name || null,
+      updated_at: nowISO()
+    };
+    const { error: e2 } = await supabase
+      .from('bot_users')
+      .update(patch)
+      .eq('tg_user_id', tg_user_id);
+
+    if (e2) console.log('[WARN] ensureUser update failed:', e2?.message || e2);
     return existing;
   }
 
-  // create new user
+  // create
   const insert = {
-    tg_user_id: tg_user_id.toString(),
-    tg_username,
-    first_name,
-    last_name,
-    plan: "free",
-    free_checks_left: FREE_DAILY_LIMIT,
+    tg_user_id,
+    tg_username: u.username || null,
+    first_name: u.first_name || null,
+    last_name: u.last_name || null,
+    plan: 'free',
+    free_checks_left: DAILY_FREE_LIMIT,
     pro_until: null,
-    created_at: nowIso(),
-    updated_at: nowIso(),
+    created_at: nowISO(),
+    updated_at: nowISO()
   };
 
-  const { data: created, error: e3 } = await sb
-    .from("bot_users")
+  const { data: created, error: e3 } = await supabase
+    .from('bot_users')
     .insert(insert)
-    .select("*")
+    .select('*')
     .single();
 
-  if (e3) throw e3;
+  if (e3) {
+    console.log('[ERROR] ensureUser insert failed:', e3?.message || e3);
+    // fallback object
+    return insert;
+  }
   return created;
 }
 
+async function getDailyQuota(tg_user_id) {
+  const day = todayKey();
+  const { data, error } = await supabase
+    .from('bot_quota_daily')
+    .select('*')
+    .eq('tg_user_id', tg_user_id)
+    .eq('day', day)
+    .maybeSingle();
+
+  if (error) {
+    console.log('[WARN] getDailyQuota failed:', error?.message || error);
+    return { day, used: 0 };
+  }
+
+  if (!data) return { day, used: 0 };
+  return { day, used: Number(data.used || 0) };
+}
+
+async function incDailyQuota(tg_user_id) {
+  const day = todayKey();
+  const quota = await getDailyQuota(tg_user_id);
+
+  if (quota.used === 0) {
+    const { error } = await supabase.from('bot_quota_daily').insert({
+      tg_user_id,
+      day,
+      used: 1,
+      created_at: nowISO()
+    });
+    if (error) console.log('[WARN] incDailyQuota insert failed:', error?.message || error);
+    return 1;
+  } else {
+    const { error } = await supabase
+      .from('bot_quota_daily')
+      .update({ used: quota.used + 1 })
+      .eq('tg_user_id', tg_user_id)
+      .eq('day', day);
+
+    if (error) console.log('[WARN] incDailyQuota update failed:', error?.message || error);
+    return quota.used + 1;
+  }
+}
+
+async function saveCheckLog({ tg_user_id, inn, provider, result_summary, risk_level, pdf_url, raw }) {
+  const payload = {
+    tg_user_id,
+    inn,
+    kind: 'inn',
+    provider: provider || 'unknown',
+    result_summary: result_summary || null,
+    risk_level: risk_level || null,
+    pdf_url: pdf_url || null,
+    raw: raw || null,
+    created_at: nowISO(),
+    updated_at: nowISO()
+  };
+
+  const { error } = await supabase.from('inn_checks').insert(payload);
+  if (error) console.log('[WARN] saveCheckLog failed:', error?.message || error);
+}
+
+/* =======================
+   Checko provider
+   NOTE: If your Checko plan/endpoint differs, adapt mapping below.
+======================= */
+async function fetchCheckoCompany(inn) {
+  if (!CHECKO_API_KEY) {
+    return { provider: 'checko', error: 'CHECKO_API_KEY не задан. Данные провайдера недоступны.', raw: null };
+  }
+
+  const url = `https://api.checko.ru/v2/company?key=${encodeURIComponent(CHECKO_API_KEY)}&inn=${encodeURIComponent(inn)}`;
+
+  try {
+    const r = await fetch(url, { method: 'GET' });
+    const raw = await r.json().catch(() => null);
+
+    if (!r.ok) {
+      return { provider: 'checko', error: `Checko HTTP ${r.status}`, raw };
+    }
+    if (!raw || raw.error) {
+      return { provider: 'checko', error: raw?.error || 'Unknown error', raw };
+    }
+    return { provider: 'checko', error: null, raw };
+  } catch (e) {
+    return { provider: 'checko', error: `Network error: ${e?.message || e}`, raw: null };
+  }
+}
+
+function normalizeCompany(checkoRaw) {
+  // Checko often returns { data: { ... } }
+  const data = checkoRaw?.data || checkoRaw?.result || checkoRaw || null;
+  if (!data) return null;
+
+  // heuristics for common fields
+  const name = data.short_name || data.name || data.full_name || data?.ul?.name || data?.ip?.fio || null;
+  const ogrn = data.ogrn || data?.ul?.ogrn || data?.ip?.ogrnip || null;
+  const kpp = data.kpp || data?.ul?.kpp || null;
+  const status = data.status || data?.state || data?.ul?.status || null;
+  const address =
+    data.address ||
+    data?.ul?.address ||
+    data?.address?.value ||
+    data?.fns?.address ||
+    null;
+
+  // a very rough risk placeholder (you will replace with real scoring rules later)
+  const risk_level = '—';
+
+  return {
+    name: name || null,
+    ogrn: ogrn || null,
+    kpp: kpp || null,
+    status: status || null,
+    address: address || null,
+    risk_level
+  };
+}
+
+/* =======================
+   OpenAI interpretation (optional)
+   We do NOT claim any "legal validity" — we generate an internal analytical note.
+======================= */
+async function openaiInterpret(company) {
+  if (!OPENAI_API_KEY) return null;
+
+  const prompt = `
+Ты — аналитик комплаенса. Сформируй краткое заключение по контрагенту на русском.
+Дай:
+1) краткую сводку (1-2 предложения)
+2) потенциальные риски (списком)
+3) что проверить дополнительно (списком)
+Важно: не называй это юридическим заключением для суда/ФНС. Это внутренняя проверка.
+
+Данные:
+Наименование: ${company?.name || '—'}
+ОГРН/ОГРНИП: ${company?.ogrn || '—'}
+КПП: ${company?.kpp || '—'}
+Статус: ${company?.status || '—'}
+Адрес: ${company?.address || '—'}
+`;
+
+  try {
+    const r = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4.1-mini',
+        input: prompt,
+        max_output_tokens: 500
+      })
+    });
+
+    const j = await r.json().catch(() => null);
+    if (!r.ok) {
+      console.log('[WARN] OpenAI error:', r.status, j);
+      return null;
+    }
+
+    // Responses API output
+    const text =
+      j?.output?.[0]?.content?.[0]?.text ||
+      j?.output_text ||
+      null;
+
+    if (!text) return null;
+    return String(text).trim();
+  } catch (e) {
+    console.log('[WARN] OpenAI network error:', e?.message || e);
+    return null;
+  }
+}
+
+/* =======================
+   PDF generation
+======================= */
+function buildPdfBuffer({ inn, company, aiText }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 50 });
+    const chunks = [];
+    doc.on('data', (c) => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    // Header
+    doc.fontSize(16).text('ОТЧЁТ О ПРОВЕРКЕ КОНТРАГЕНТА (ИНН)', { align: 'center' });
+    doc.moveDown(0.5);
+    doc.fontSize(10).fillColor('#555').text(`Дата формирования: ${new Date().toLocaleString('ru-RU')}`, { align: 'center' });
+    doc.moveDown(1);
+    doc.fillColor('#000');
+
+    // Block
+    doc.fontSize(12).text(`ИНН: ${inn}`);
+    doc.moveDown(0.5);
+
+    doc.fontSize(12).text('Сведения об организации (по данным провайдера):', { underline: true });
+    doc.moveDown(0.5);
+
+    const rows = [
+      ['Наименование', safeText(company?.name)],
+      ['ОГРН / ОГРНИП', safeText(company?.ogrn)],
+      ['КПП', safeText(company?.kpp)],
+      ['Статус', safeText(company?.status)],
+      ['Адрес', safeText(company?.address)]
+    ];
+
+    rows.forEach(([k, v]) => {
+      doc.fontSize(11).text(`${k}: `, { continued: true }).font('Helvetica-Bold').text(v);
+      doc.font('Helvetica');
+      doc.moveDown(0.2);
+    });
+
+    doc.moveDown(0.7);
+
+    doc.fontSize(12).text('Примечание:', { underline: true });
+    doc.moveDown(0.3);
+    doc.fontSize(10).fillColor('#333').text(
+      'Данный отчёт носит информационный характер и предназначен для внутренней проверки. ' +
+      'Не является документом ФНС и не гарантирует отсутствие рисков. ' +
+      'Рекомендуется проводить комплексную проверку контрагента.'
+    );
+    doc.fillColor('#000');
+
+    if (aiText) {
+      doc.moveDown(1);
+      doc.fontSize(12).text('Аналитическое резюме (ИИ):', { underline: true });
+      doc.moveDown(0.4);
+      doc.fontSize(10).fillColor('#111').text(aiText);
+      doc.fillColor('#000');
+    }
+
+    // Footer stamp-like
+    doc.moveDown(1.5);
+    doc.fontSize(10).fillColor('#444').text('Отметка: проверено автоматически системой ProverkaBiz.', { align: 'right' });
+    doc.fillColor('#000');
+
+    doc.end();
+  });
+}
+
+async function uploadPdfToSupabase({ tg_user_id, inn, pdfBuffer }) {
+  const bucket = SUPABASE_STORAGE_BUCKET || 'ProverkaINN';
+  const path = `reports/${tg_user_id}/${inn}_${Date.now()}.pdf`;
+
+  const { error: upErr } = await supabase.storage
+    .from(bucket)
+    .upload(path, pdfBuffer, {
+      contentType: 'application/pdf',
+      upsert: false
+    });
+
+  if (upErr) {
+    return { error: `PDF не загружен (проверь Supabase Storage / ключи): ${upErr.message}`, publicUrl: null };
+  }
+
+  // public URL
+  const { data } = supabase.storage.from(bucket).getPublicUrl(path);
+  return { error: null, publicUrl: data?.publicUrl || null };
+}
+
+/* =======================
+   Text formatting for Telegram
+======================= */
+function buildTelegramReport({ inn, company, aiText, pdfUrl, quotaNote }) {
+  const lines = [];
+
+  lines.push(`🔎 *Сводка по ИНН ${inn}*`);
+  lines.push('');
+
+  lines.push('*Сведения:*');
+  lines.push(`• *Наименование:* ${safeText(company?.name)}`);
+  lines.push(`• *ОГРН/ОГРНИП:* ${safeText(company?.ogrn)}`);
+  lines.push(`• *КПП:* ${safeText(company?.kpp)}`);
+  lines.push(`• *Статус:* ${safeText(company?.status)}`);
+  lines.push(`• *Адрес:* ${safeText(company?.address)}`);
+
+  lines.push('');
+  lines.push(`⚠️ *Уровень риска:* ${safeText(company?.risk_level)}`);
+
+  if (aiText) {
+    lines.push('');
+    lines.push('🧠 *Аналитика (ИИ):*');
+    // avoid too long message
+    const trimmed = aiText.length > 1200 ? aiText.slice(0, 1200) + '…' : aiText;
+    lines.push(trimmed);
+  }
+
+  lines.push('');
+  if (pdfUrl) {
+    lines.push(`📄 *PDF-отчёт:* ${pdfUrl}`);
+  } else {
+    lines.push('📄 *PDF не загружен* (проверь Supabase Storage / ключи).');
+  }
+
+  if (quotaNote) {
+    lines.push('');
+    lines.push(quotaNote);
+  }
+
+  lines.push('');
+  lines.push('_Отчёт информационный, для внутренней проверки. Не документ ФНС._');
+
+  return lines.join('\n');
+}
+
+/* =======================
+   Business logic: can check?
+======================= */
 function isPro(userRow) {
   if (!userRow) return false;
-  if (userRow.plan === "pro") return true;
+  if (userRow.plan === 'pro') return true;
   if (userRow.pro_until) {
-    const until = new Date(userRow.pro_until);
-    if (!isNaN(until) && until > new Date()) return true;
+    const t = new Date(userRow.pro_until).getTime();
+    return Number.isFinite(t) && t > Date.now();
   }
   return false;
 }
 
-async function resetDailyQuotaIfNeeded(userRow) {
-  // minimalist daily reset: if updated_at is not today -> reset
-  // For production, лучше cron/Edge Function. Но это работает “на коленке”.
-  if (!userRow?.updated_at) return userRow;
+async function canDoCheck(userRow) {
+  const tg_user_id = userRow.tg_user_id;
 
-  const last = new Date(userRow.updated_at);
-  const now = new Date();
+  if (isPro(userRow)) return { ok: true, note: null };
 
-  const sameDay =
-    last.getFullYear() === now.getFullYear() &&
-    last.getMonth() === now.getMonth() &&
-    last.getDate() === now.getDate();
-
-  if (sameDay) return userRow;
-
-  // reset free limit only for free users
-  if (isPro(userRow)) return userRow;
-
-  const { data, error } = await sb
-    .from("bot_users")
-    .update({ free_checks_left: FREE_DAILY_LIMIT, updated_at: nowIso() })
-    .eq("tg_user_id", userRow.tg_user_id)
-    .select("*")
-    .single();
-
-  if (error) throw error;
-  return data;
-}
-
-async function decrementFreeCheck(userRow) {
+  // daily quota + free_checks_left
   const left = Number(userRow.free_checks_left ?? 0);
-  const next = Math.max(0, left - 1);
-
-  const { data, error } = await sb
-    .from("bot_users")
-    .update({ free_checks_left: next, updated_at: nowIso() })
-    .eq("tg_user_id", userRow.tg_user_id)
-    .select("*")
-    .single();
-
-  if (error) throw error;
-  return data;
-}
-
-function cacheIsFresh(fetchedAt) {
-  if (!fetchedAt) return false;
-  const dt = new Date(fetchedAt);
-  if (isNaN(dt)) return false;
-  const diffMs = Date.now() - dt.getTime();
-  const ttlMs = CACHE_TTL_HOURS * 60 * 60 * 1000;
-  return diffMs < ttlMs;
-}
-
-async function getCachedInn(inn) {
-  const { data, error } = await sb
-    .from("inn_cache")
-    .select("*")
-    .eq("inn", inn)
-    .maybeSingle();
-
-  if (error) throw error;
-  if (!data) return null;
-  if (!cacheIsFresh(data.fetched_at)) return null;
-  return data;
-}
-
-async function saveInnCache(inn, payload) {
-  const row = {
-    inn,
-    payload,
-    fetched_at: nowIso(),
-  };
-
-  // upsert by primary key (inn)
-  const { error } = await sb
-    .from("inn_cache")
-    .upsert(row, { onConflict: "inn" });
-
-  if (error) throw error;
-}
-
-async function saveCheckLog({ tg_user_id, inn, result_summary, risk_level, pdf_url }) {
-  const row = {
-    tg_user_id: tg_user_id.toString(),
-    inn,
-    created_at: nowIso(),
-    result_summary: result_summary || null,
-    risk_level: risk_level || null,
-    pdf_url: pdf_url || null,
-  };
-
-  const { error } = await sb.from("inn_checks").insert(row);
-  if (error) throw error;
-}
-
-/* =========================
-   Checko provider
-========================= */
-
-async function fetchCheckoCompany(inn) {
-  if (!CHECKO_API_KEY) {
+  if (left <= 0) {
     return {
-      provider: "checko",
-      error: "CHECKO_API_KEY не задан. Данные провайдера недоступны.",
-      raw: null,
+      ok: false,
+      note: '⛔️ Лимит на сегодня исчерпан. В PRO будет безлимит + история + PDF.'
     };
   }
 
-  // Checko endpoint (basic):
-  // GET https://api.checko.ru/v2/company?key=API_KEY&inn=INN
-  const url = `https://api.checko.ru/v2/company?key=${encodeURIComponent(
-    CHECKO_API_KEY
-  )}&inn=${encodeURIComponent(inn)}`;
-
-  const r = await fetch(url, { method: "GET" });
-  const raw = await r.json().catch(() => null);
-
-  console.log("CHECKO RAW RESPONSE:", JSON.stringify(raw, null, 2));
-   
-  if (!r.ok) {
+  const q = await getDailyQuota(tg_user_id);
+  if (q.used >= DAILY_FREE_LIMIT) {
     return {
-      provider: "checko",
-      error: `Checko HTTP ${r.status}`,
-      raw,
+      ok: false,
+      note: '⛔️ Дневной лимит free исчерпан. В PRO будет безлимит + история + PDF.'
     };
   }
 
-  // checko returns { data: {...} } or { error: {...} }
-  if (!raw || raw.error) {
-    return { provider: "checko", error: raw?.error || "Unknown error", raw };
-  }
-
-  return { provider: "checko", error: null, raw };
+  return { ok: true, note: `✅ Free-лимит: осталось ${left} проверок.` };
 }
 
-/* =========================
-   Normalization
-========================= */
+async function consumeFree(userRow) {
+  const tg_user_id = userRow.tg_user_id;
+  const left = Math.max(0, Number(userRow.free_checks_left ?? 0) - 1);
 
-function normalizeCompany(checkoRaw) {
-  // Try to map common fields
-  const data = checkoRaw?.data || checkoRaw?.Data || checkoRaw?.result || null;
-  if (!data) return null;
+  const { error } = await supabase
+    .from('bot_users')
+    .update({ free_checks_left: left, updated_at: nowISO() })
+    .eq('tg_user_id', tg_user_id);
 
-  // Some Checko variants:
-  // data = { НаимОрг, ОГРН, КПП, Статус, Адрес, ... } or latin fields
-  const name =
-    data.short_name ||
-    data.full_name ||
-    data.name ||
-    data.НаимОрг ||
-    data.Наименование ||
-    data.НаимСокр ||
-    null;
+  if (error) console.log('[WARN] consumeFree update failed:', error?.message || error);
+  await incDailyQuota(tg_user_id);
 
-  const ogrn = data.ogrn || data.ОГРН || null;
-  const kpp = data.kpp || data.КПП || null;
-  const status = data.status || data.Статус || null;
-
-  const address =
-    data.address ||
-    data.Адрес ||
-    data.АдресПолн ||
-    data.address_full ||
-    null;
-
-  const inn = data.inn || data.ИНН || null;
-
-  // Risk / flags can be expanded later (red flags, bankrupt, etc.)
-  // We'll keep simple for now:
-  const risk_level = data.risk_level || data.Риск || null;
-
-  return {
-    inn,
-    name,
-    ogrn,
-    kpp,
-    status,
-    address,
-    risk_level,
-    raw: data,
-  };
+  return left;
 }
 
-function riskLabel(risk) {
-  if (!risk) return "—";
-  const s = String(risk).toLowerCase();
-  if (s.includes("выс") || s.includes("high")) return "Высокий";
-  if (s.includes("сред") || s.includes("medium")) return "Средний";
-  if (s.includes("низ") || s.includes("low")) return "Низкий";
-  return String(risk);
-}
+/* =======================
+   Telegram bot
+======================= */
+const bot = new Telegraf(BOT_TOKEN);
 
-/* =========================
-   OpenAI interpretation
-========================= */
+bot.start(async (ctx) => {
+  await ensureUser(ctx);
 
-async function aiInterpretation(company) {
-  if (!openai) return null;
-
-  // We make a compact “legal style” note (NOT an official document).
-  const payload = {
-    inn: company.inn,
-    name: company.name,
-    ogrn: company.ogrn,
-    kpp: company.kpp,
-    status: company.status,
-    address: company.address,
-    risk_level: company.risk_level,
-  };
-
-  const prompt = `
-Ты — эксперт по проверке контрагентов в РФ.
-Составь краткое заключение (5–8 пунктов) в стиле "юридической справки" по данным компании.
-Тон: деловой, нейтральный. Без фантазий. Если данных мало — прямо скажи "данных недостаточно".
-Обязательно добавь дисклеймер: "Справка информационная, не является официальным документом ФНС".
-Данные (JSON): ${JSON.stringify(payload)}
-`;
-
-  const resp = await openai.chat.completions.create({
-    model: OPENAI_MODEL,
-    messages: [
-      { role: "system", content: "Пиши по-русски, строго по фактам из JSON." },
-      { role: "user", content: prompt },
-    ],
-    temperature: 0.2,
-  });
-
-  const text = resp.choices?.[0]?.message?.content?.trim() || null;
-  return text;
-}
-
-/* =========================
-   PDF report
-========================= */
-
-function buildPdfBuffer({ inn, company, aiText }) {
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = new PDFDocument({ size: "A4", margin: 48 });
-
-      const chunks = [];
-      doc.on("data", (c) => chunks.push(c));
-      doc.on("end", () => resolve(Buffer.concat(chunks)));
-
-      const title = "Справка по контрагенту (информационная)";
-      doc.fontSize(16).text(title, { align: "center" });
-      doc.moveDown(0.5);
-      doc.fontSize(10).fillColor("gray").text(`Дата формирования: ${new Date().toLocaleString("ru-RU")}`, {
-        align: "center",
-      });
-      doc.moveDown(1);
-      doc.fillColor("black");
-
-      doc.fontSize(12).text(`ИНН: ${inn}`);
-      doc.moveDown(0.2);
-
-      if (company?.name) doc.text(`Наименование: ${company.name}`);
-      if (company?.ogrn) doc.text(`ОГРН: ${company.ogrn}`);
-      if (company?.kpp) doc.text(`КПП: ${company.kpp}`);
-      if (company?.status) doc.text(`Статус: ${company.status}`);
-      if (company?.address) doc.text(`Адрес: ${company.address}`);
-      doc.text(`Уровень риска: ${riskLabel(company?.risk_level)}`);
-
-      doc.moveDown(1);
-      doc.fontSize(12).text("Заключение:", { underline: true });
-      doc.moveDown(0.4);
-
-      if (aiText) {
-        doc.fontSize(11).text(aiText, { align: "left" });
-      } else {
-        doc.fontSize(11).text(
-          "Заключение не сформировано (не подключен OpenAI или недостаточно данных).",
-          { align: "left" }
-        );
-      }
-
-      doc.moveDown(1.2);
-      doc
-        .fontSize(9)
-        .fillColor("gray")
-        .text(
-          "Дисклеймер: справка информационная, предназначена для внутренней проверки. Не является официальным документом ФНС/судебным доказательством. Источник данных: Checko (api.checko.ru).",
-          { align: "left" }
-        );
-
-      doc.end();
-    } catch (e) {
-      reject(e);
-    }
-  });
-}
-
-async function uploadPdfToSupabase({ inn, pdfBuffer }) {
-  const fileName = `reports/${inn}/${Date.now()}_report.pdf`;
-
-  const { error: uploadErr } = await sb.storage
-    .from(SUPABASE_STORAGE_BUCKET)
-    .upload(fileName, pdfBuffer, {
-      contentType: "application/pdf",
-      upsert: true,
-    });
-
-  if (uploadErr) throw uploadErr;
-
-  // If bucket is public, getPublicUrl works
-  const { data } = sb.storage.from(SUPABASE_STORAGE_BUCKET).getPublicUrl(fileName);
-  const publicUrl = data?.publicUrl || null;
-
-  return publicUrl;
-}
-
-/* =========================
-   Telegram flow
-========================= */
-
-const state = new Map(); // chatId -> { mode: "await_inn" }
-
-async function onStart(chatId) {
-  const text =
-    "Привет! Я проверяю контрагентов по ИНН.\n\n" +
+  const hello =
+    `Привет! Я проверяю контрагентов по ИНН.\n\n` +
     `Пришли ИНН (10 или 12 цифр) одним сообщением.\n` +
-    `Лимит free: ${FREE_DAILY_LIMIT} проверок в день.\n\n` +
-    "Ниже кнопки меню 👇";
+    `Лимит free: ${DAILY_FREE_LIMIT} проверки в день.\n\n` +
+    `Жми кнопку ниже 👇`;
 
-  await sendMessage(chatId, escapeHtml(text), { reply_markup: mainMenu() });
-}
-
-async function onPricing(chatId) {
-  const text =
-    "💎 <b>Тариф PRO</b>\n\n" +
-    "В PRO будет:\n" +
-    "— безлимит проверок\n" +
-    "— история проверок\n" +
-    "— PDF-отчёты с отметкой «проверено»\n" +
-    "— риск-баллы/красные флаги\n\n" +
-    "Оплату подключим следующим шагом (Stripe/ЮKassa/Telegram Payments).\n" +
-    "Пока можешь написать в поддержку — включим вручную.";
-
-  await sendMessage(chatId, text, { reply_markup: afterCheckMenu() });
-}
-
-async function onAbout(chatId) {
-  const text =
-    "❓ <b>Что я проверяю?</b>\n\n" +
-    "— основные реквизиты организации (наименование, ОГРН, КПП, статус, адрес)\n" +
-    "— уровень риска (если провайдер даёт)\n" +
-    "— формирую информационную справку (PDF)\n\n" +
-    "⚠️ Это не официальный документ ФНС. Это инструмент для внутренней проверки.";
-
-  await sendMessage(chatId, text, { reply_markup: afterCheckMenu() });
-}
-
-async function onSupport(chatId) {
-  const text =
-    "🆘 <b>Поддержка</b>\n\n" +
-    "Напиши сюда: @YOUR_SUPPORT_USERNAME\n" +
-    "Или ответь на это сообщение — мы увидим в логах и поможем.";
-
-  await sendMessage(chatId, text, { reply_markup: afterCheckMenu() });
-}
-
-async function askInn(chatId) {
-  state.set(chatId, { mode: "await_inn" });
-  await sendMessage(
-    chatId,
-    "Ок. Пришли ИНН (10 или 12 цифр) одним сообщением.",
-    { reply_markup: afterCheckMenu() }
-  );
-}
-
-function formatResultMessage({ inn, company, aiText, pdfUrl, userRow }) {
-  const lines = [];
-  lines.push(`🔎 <b>Сводка по ИНН ${escapeHtml(inn)}</b>`);
-  lines.push("");
-
-  const risk = riskLabel(company?.risk_level);
-  lines.push(`<b>Уровень риска:</b> ${escapeHtml(risk)}`);
-  lines.push("");
-
-  lines.push("<b>Сводка:</b>");
-  lines.push(`• Наименование: ${escapeHtml(company?.name || "—")}`);
-  lines.push(`• ОГРН: ${escapeHtml(company?.ogrn || "—")}`);
-  lines.push(`• КПП: ${escapeHtml(company?.kpp || "—")}`);
-  lines.push(`• Статус: ${escapeHtml(company?.status || "—")}`);
-  lines.push(`• Адрес: ${escapeHtml(company?.address || "—")}`);
-  lines.push("");
-
-  if (pdfUrl) {
-    lines.push(`📄 <b>PDF-отчёт:</b> ${escapeHtml(pdfUrl)}`);
-    lines.push("");
-  } else {
-    lines.push("📄 <b>PDF не загружен</b> (проверь Supabase Storage / ключи / bucket).");
-    lines.push("");
-  }
-
-  if (aiText) {
-    lines.push("🧠 <b>Краткое заключение:</b>");
-    lines.push(escapeHtml(aiText));
-    lines.push("");
-  }
-
-  const isProNow = isPro(userRow);
-  if (!isProNow) {
-    lines.push(`🧾 <i>Лимит free на сегодня: осталось ${escapeHtml(String(userRow.free_checks_left ?? 0))} проверок.</i>`);
-    lines.push("💎 В PRO будет безлимит + история + риск-баллы + PDF.");
-  } else {
-    lines.push("💎 <b>PRO активен:</b> безлимит проверок.");
-  }
-
-  lines.push("");
-  lines.push("⚠️ <i>Справка информационная, для внутренней проверки. Не официальный документ ФНС.</i>");
-
-  return lines.join("\n");
-}
-
-/* =========================
-   Main INN handler
-========================= */
-
-async function handleInnCheck(chatId, tgUser, inn) {
-  // ensure user
-  let userRow = await ensureUser(tgUser);
-  userRow = await resetDailyQuotaIfNeeded(userRow);
-
-  const pro = isPro(userRow);
-
-  if (!pro) {
-    const left = Number(userRow.free_checks_left ?? 0);
-    if (left <= 0) {
-      const text =
-        "⛔ Лимит на сегодня исчерпан.\n\n" +
-        "💎 В PRO будет безлимит + риск-баллы + история.\n" +
-        "Нажми «Тариф PRO» или напиши в поддержку.";
-      await sendMessage(chatId, text, { reply_markup: afterCheckMenu() });
-      return;
-    }
-    userRow = await decrementFreeCheck(userRow);
-  }
-
-  // send "processing"
-  const msg = await sendMessage(chatId, `⏳ Проверяю ИНН ${inn}...`);
-
-  try {
-    // cache first
-    const cached = await getCachedInn(inn);
-    let providerResp;
-
-    if (cached?.payload) {
-      providerResp = cached.payload;
-    } else {
-      providerResp = await fetchCheckoCompany(inn);
-      await saveInnCache(inn, providerResp);
-    }
-
-    if (providerResp?.error) {
-      await editMessage(
-        chatId,
-        msg.message_id,
-        `❌ Не удалось получить данные провайдера.\n\nПричина: ${escapeHtml(
-          String(providerResp.error)
-        )}\n\nПроверь CHECKO_API_KEY.`,
-        { reply_markup: afterCheckMenu() }
-      );
-      return;
-    }
-
-    const company = normalizeCompany(providerResp?.raw);
-    if (!company) {
-      await editMessage(
-        chatId,
-        msg.message_id,
-        `⚠️ Данные по ИНН ${inn} не найдены или формат ответа неожиданен.\n\nПопробуй позже или проверь ключ Checko.`,
-        { reply_markup: afterCheckMenu() }
-      );
-      return;
-    }
-
-    // AI text
-    const aiText = await aiInterpretation(company);
-
-    // PDF
-    const pdfBuffer = await buildPdfBuffer({ inn, company, aiText });
-    let pdfUrl = null;
-    try {
-      pdfUrl = await uploadPdfToSupabase({ inn, pdfBuffer });
-    } catch (e) {
-      console.error("PDF upload failed:", e);
-      pdfUrl = null;
-    }
-
-    // log to DB
-    try {
-      await saveCheckLog({
-        tg_user_id: BigInt(tgUser.id),
-        inn,
-        result_summary: company?.name || null,
-        risk_level: company?.risk_level ? String(company.risk_level) : null,
-        pdf_url: pdfUrl,
-      });
-    } catch (e) {
-      console.error("saveCheckLog failed:", e);
-    }
-
-    const text = formatResultMessage({ inn, company, aiText, pdfUrl, userRow });
-    await editMessage(chatId, msg.message_id, text, { reply_markup: afterCheckMenu() });
-  } catch (e) {
-    console.error("handleInnCheck error:", e);
-    await editMessage(
-      chatId,
-      msg.message_id,
-      `❌ Ошибка на сервере: ${escapeHtml(String(e.message || e))}`,
-      { reply_markup: afterCheckMenu() }
-    );
-  }
-}
-
-/* =========================
-   Telegram webhook
-========================= */
-
-app.post("/webhook", async (req, res) => {
-  try {
-    const update = req.body;
-
-    // callback_query
-    if (update.callback_query) {
-      const cq = update.callback_query;
-      const chatId = cq.message?.chat?.id;
-      const data = cq.data;
-
-      if (!chatId) {
-        await answerCallbackQuery(cq.id, "Ошибка: chatId не найден", true);
-        return res.json({ ok: true });
-      }
-
-      if (data === "CHECK_INN") {
-        await answerCallbackQuery(cq.id, "Ок, пришли ИНН сообщением.");
-        await askInn(chatId);
-      } else if (data === "PRICING") {
-        await answerCallbackQuery(cq.id, "Тарифы");
-        await onPricing(chatId);
-      } else if (data === "ABOUT") {
-        await answerCallbackQuery(cq.id, "Что проверяем");
-        await onAbout(chatId);
-      } else if (data === "SUPPORT") {
-        await answerCallbackQuery(cq.id, "Поддержка");
-        await onSupport(chatId);
-      } else {
-        await answerCallbackQuery(cq.id, "Ок");
-      }
-
-      return res.json({ ok: true });
-    }
-
-    // message
-    if (update.message) {
-      const msg = update.message;
-      const chatId = msg.chat.id;
-      const text = (msg.text || "").trim();
-      const tgUser = msg.from;
-
-      if (text === "/start") {
-        await ensureUser(tgUser).catch((e) => console.error("ensureUser error:", e));
-        await onStart(chatId);
-        return res.json({ ok: true });
-      }
-
-      // if waiting for INN
-      const st = state.get(chatId);
-      if (st?.mode === "await_inn") {
-        if (!isInn(text)) {
-          await sendMessage(
-            chatId,
-            "❗ ИНН должен быть 10 или 12 цифр. Пришли корректный ИНН одним сообщением.",
-            { reply_markup: afterCheckMenu() }
-          );
-          return res.json({ ok: true });
-        }
-
-        // do check
-        await handleInnCheck(chatId, tgUser, text);
-        return res.json({ ok: true });
-      }
-
-      // If user types an INN without pressing button – accept
-      if (isInn(text)) {
-        await handleInnCheck(chatId, tgUser, text);
-        return res.json({ ok: true });
-      }
-
-      // default
-      await sendMessage(chatId, "Нажми кнопку «Проверить ИНН» или пришли ИНН цифрами.", {
-        reply_markup: mainMenu(),
-      });
-      return res.json({ ok: true });
-    }
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("webhook error:", e);
-    return res.json({ ok: true });
-  }
+  await ctx.reply(hello, mainKeyboard());
 });
 
-/* =========================
-   Webhook setup
-========================= */
+bot.hears([BTN_CHECK, BTN_CHECK_AGAIN], async (ctx) => {
+  await ensureUser(ctx);
+  await ctx.reply('Ок. Пришли ИНН (10 или 12 цифр) одним сообщением.', mainKeyboard());
+});
 
-async function setWebhook() {
-  if (!PUBLIC_BASE_URL) {
-    console.warn("PUBLIC_BASE_URL missing, webhook setup skipped");
+bot.hears(BTN_WHAT, async (ctx) => {
+  const text =
+    `Я подтягиваю базовые сведения по ИНН:\n` +
+    `• наименование\n• ОГРН/ОГРНИП\n• КПП\n• статус\n• адрес\n\n` +
+    `В PRO:\n• безлимит проверок\n• история\n• PDF-отчёты с отметкой "проверено"\n• риск-флаги (постепенно расширим)\n`;
+  await ctx.reply(text, mainKeyboard());
+});
+
+bot.hears(BTN_PRO, async (ctx) => {
+  await ensureUser(ctx);
+
+  const text =
+    `💎 *Тариф PRO*\n\n` +
+    `В PRO будет:\n` +
+    `— безлимит проверок\n` +
+    `— история проверок\n` +
+    `— PDF-отчёты с отметкой «проверено»\n` +
+    `— риск-баллы / «красные флаги»\n\n` +
+    `Оплата подключим следующим шагом (Stripe/ЮKassa/Telegram Payments).\n` +
+    `Пока можешь написать в поддержку — включу PRO вручную.`;
+
+  await ctx.reply(text, { parse_mode: 'Markdown', ...mainKeyboard() });
+});
+
+bot.hears(BTN_SUPPORT, async (ctx) => {
+  const uname = SUPPORT_USERNAME ? `@${SUPPORT_USERNAME.replace(/^@/, '')}` : '@YOUR_SUPPORT_USERNAME';
+  await ctx.reply(`Напиши сюда: ${uname}\nИли ответь на это сообщение — мы увидим в логах и поможем.`, mainKeyboard());
+});
+
+/* =======================
+   Main handler: INN message
+======================= */
+bot.on('text', async (ctx) => {
+  const user = await ensureUser(ctx);
+  const tg_user_id = user.tg_user_id;
+
+  const inn = normalizeInn(ctx.message.text);
+  if (!inn) {
+    await ctx.reply('❗️ИНН должен быть 10 или 12 цифр. Пришли корректный ИНН одним сообщением.', mainKeyboard());
     return;
   }
 
-  const url = `${PUBLIC_BASE_URL.replace(/\/$/, "")}/webhook`;
-  try {
-    const r = await tgCall("setWebhook", { url });
-    console.log("[INFO] Webhook set:", url, r ? "true" : "false");
-  } catch (e) {
-    console.error("setWebhook failed:", e);
+  const allowed = await canDoCheck(user);
+  if (!allowed.ok) {
+    await ctx.reply(`⛔️ ${allowed.note}`, mainKeyboard());
+    return;
   }
+
+  await ctx.reply(`🔎 Проверяю ИНН ${inn}...`, mainKeyboard());
+
+  // Provider fetch
+  const providerRes = await fetchCheckoCompany(inn);
+  if (providerRes.error) {
+    await ctx.reply(
+      `⚠️ Провайдер недоступен: ${providerRes.error}\n` +
+      `Проверь ключ CHECKO_API_KEY и доступ к API.`,
+      mainKeyboard()
+    );
+    return;
+  }
+
+  const company = normalizeCompany(providerRes.raw);
+  if (!company) {
+    await ctx.reply('⚠️ Не удалось нормализовать ответ провайдера (формат данных изменился).', mainKeyboard());
+    return;
+  }
+
+  // consume free (after successful provider response)
+  let quotaNote = null;
+  if (!isPro(user)) {
+    const left = await consumeFree(user);
+    quotaNote = `🔻 Осталось бесплатных проверок: ${left}`;
+  }
+
+  // OpenAI interpretation (optional)
+  const aiText = await openaiInterpret(company);
+
+  // PDF
+  let pdfUrl = null;
+  let pdfUploadError = null;
+  try {
+    const pdfBuffer = await buildPdfBuffer({ inn, company, aiText });
+    const up = await uploadPdfToSupabase({ tg_user_id, inn, pdfBuffer });
+    if (up.error) pdfUploadError = up.error;
+    pdfUrl = up.publicUrl;
+  } catch (e) {
+    pdfUploadError = `PDF error: ${e?.message || e}`;
+  }
+
+  // Save log
+  const summary = `${company?.name || '—'}; ОГРН: ${company?.ogrn || '—'}; КПП: ${company?.kpp || '—'}`;
+  await saveCheckLog({
+    tg_user_id,
+    inn,
+    provider: providerRes.provider,
+    result_summary: summary,
+    risk_level: company.risk_level || '—',
+    pdf_url: pdfUrl,
+    raw: providerRes.raw
+  });
+
+  const report = buildTelegramReport({ inn, company, aiText, pdfUrl, quotaNote });
+
+  if (pdfUploadError) {
+    console.log('[WARN] PDF upload:', pdfUploadError);
+  }
+
+  await ctx.reply(report, { parse_mode: 'Markdown', disable_web_page_preview: true, ...mainKeyboard() });
+});
+
+/* =======================
+   Express (Render webhook)
+======================= */
+const app = express();
+app.use(express.json());
+
+app.get('/', (req, res) => res.status(200).send('OK'));
+
+if (PUBLIC_BASE_URL) {
+  app.post('/webhook', (req, res) => {
+    bot.handleUpdate(req.body, res).catch((e) => {
+      console.log('[ERROR] handleUpdate:', e?.message || e);
+      res.status(200).send('OK');
+    });
+  });
 }
 
-/* =========================
-   Start server
-========================= */
-app.listen(PORT, async () => {
-  console.log(`[INFO] Server started on port ${PORT}`);
-  console.log(`[INFO] Supabase: enabled`);
-  await setWebhook();
-  console.log("✅ Your service is live 🚀");
+async function start() {
+  // start express
+  app.listen(APP_PORT, () => {
+    console.log(`[INFO] Server started on port ${APP_PORT}`);
+    console.log('[INFO] Supabase: enabled');
+  });
+
+  // webhook
+  if (PUBLIC_BASE_URL) {
+    const hook = `${PUBLIC_BASE_URL.replace(/\/$/, '')}/webhook`;
+    await bot.telegram.setWebhook(hook);
+    console.log('[INFO] Webhook set:', hook);
+  } else {
+    console.log('[WARN] PUBLIC_BASE_URL missing, webhook setup skipped');
+  }
+
+  console.log('[INFO] Your service is live 🚀');
+}
+
+start().catch((e) => {
+  console.error(e);
+  process.exit(1);
 });
