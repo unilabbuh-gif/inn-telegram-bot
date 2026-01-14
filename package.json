@@ -1,9 +1,9 @@
 {
   "name": "inn-telegram-bot",
-  "version": "2.0.0",
-  "description": "Telegram bot: INN checks via Checko + AI summary + PDF reports + Supabase",
-  "type": "module",
+  "version": "1.0.0",
+  "description": "Telegram bot for INN checks (Checko) with premium PDF reports + Supabase Storage + OpenAI interpretation",
   "main": "index.js",
+  "type": "module",
   "engines": {
     "node": ">=18"
   },
@@ -11,9 +11,10 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0",
-    "dotenv": "^16.4.5",
+    "@supabase/supabase-js": "^2.45.4",
     "express": "^4.19.2",
-    "pdfkit": "^0.17.1"
+    "node-fetch": "^3.3.2",
+    "openai": "^4.56.0",
+    "pdfkit": "^0.16.0"
   }
 }
