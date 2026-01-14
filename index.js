@@ -368,6 +368,8 @@ async function fetchCheckoCompany(inn) {
   const r = await fetch(url, { method: "GET" });
   const raw = await r.json().catch(() => null);
 
+  console.log("CHECKO RAW RESPONSE:", JSON.stringify(raw, null, 2));
+   
   if (!r.ok) {
     return {
       provider: "checko",
